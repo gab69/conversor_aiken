@@ -1,797 +1,613 @@
 <?php
 /**
- * Conversor de banco de preguntas (Word/PDF) a formato AIKEN para Moodle
- * ------------------------------------------------------------------
- * Archivo único: sube tu banco de preguntas (.docx o .pdf) y descarga un
- * .txt en formato AIKEN, listo para importar en Moodle
- * (Banco de preguntas > Importar > formato Aiken).
+ * Conversor de Word (.docx) a formato AIKEN
+ * ------------------------------------------
+ * Aplicativo web de un solo archivo (index.php), sin dependencias externas
+ * (no requiere Composer, ni mbstring, ni librerías de terceros).
  *
- * No modifica el contenido de enunciados ni alternativas: solo cambia
- * el FORMATO al que exige AIKEN (una línea por enunciado/alternativa,
- * letras A-F en mayúscula, línea ANSWER: con la letra correcta).
+ * Flujo:
+ *   1) El usuario sube uno o varios archivos .docx (bancos de preguntas / controles de lectura).
+ *   2) El sistema analiza cada documento, detecta preguntas, opciones y la respuesta
+ *      correcta (usando resaltado, negrita o símbolo ✓, según cómo la haya marcado el docente).
+ *   3) Se muestra una pantalla de revisión donde el usuario puede corregir manualmente
+ *      cualquier respuesta mal detectada.
+ *   4) Se descarga el resultado: por unidad (un .txt por archivo, o un .zip con todos)
+ *      o en conjunto (un solo .txt combinado).
  *
- * Detección de la alternativa correcta:
- *   - En DOCX: se basa en NEGRITA y/o RESALTADO aplicados a la alternativa
- *     correcta (patrón típico de bancos de preguntas en Word).
- *   - En PDF: al perderse el formato durante la extracción de texto, se
- *     basa en marcadores explícitos (*alternativa, "(correcta)", ✓/√) o en
- *     un bloque "Clave de respuestas" al final del documento.
- *   - Si no puede determinarse, la pregunta se incluye igual (con "A" por
- *     defecto) y se lista en las advertencias para que la revises a mano.
- *
- * Requisitos: PHP 7.4+ con extensiones zip, dom, mbstring (vienen por
- * defecto). Para PDF: utilidad "pdftotext" (paquete poppler-utils).
+ * Requisitos del servidor: PHP 7.4+ con extensiones "zip" y "xml" (ambas muy comunes).
  */
 
 session_start();
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE);
 
-const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB
+// ============================================================================
+//  CONFIGURACIÓN
+// ============================================================================
+define('APP_TITLE', 'Conversor Word → AIKEN');
+define('MAX_FILES', 30);
+$OPTION_LETTERS = ['A','B','C','D','E','F','G','H'];
 
-/* =====================================================================
- * CLASE: MiniZipReader
- * Lector de archivos ZIP en PHP puro, usado como respaldo cuando el
- * servidor no tiene habilitada la extensión "zip" (clase ZipArchive).
- * Solo necesita la extensión "zlib" (función gzinflate), presente en
- * prácticamente cualquier instalación de PHP. Un .docx es un .zip, así
- * que esto basta para leer "word/document.xml" de dentro de él.
- * ===================================================================== */
-class MiniZipReader
-{
-    /** @return string|false */
-    public static function extract(string $zipPath, string $entryName)
-    {
-        $data = file_get_contents($zipPath);
-        if ($data === false) {
-            return false;
-        }
+// ============================================================================
+//  UTILIDADES DE TEXTO (sin depender de mbstring)
+// ============================================================================
 
-        $eocdPos = strrpos($data, "\x50\x4b\x05\x06");
-        if ($eocdPos === false) {
-            return false;
-        }
-
-        $eocd = substr($data, $eocdPos, 22);
-        if (strlen($eocd) < 22) {
-            return false;
-        }
-        $fields = unpack('Vsig/vdisk/vcdDisk/ventriesDisk/ventries/VcdSize/VcdOffset/vcommentLen', $eocd);
-        $cdOffset = $fields['cdOffset'];
-        $entries = $fields['entries'];
-
-        $pos = $cdOffset;
-        for ($i = 0; $i < $entries; $i++) {
-            if (substr($data, $pos, 4) !== "\x50\x4b\x01\x02") {
-                break;
-            }
-            $header = substr($data, $pos, 46);
-            $cd = unpack(
-                'Vsig/vverMade/vverNeed/vflag/vmethod/vmtime/vmdate/Vcrc/VcompSize/VuncompSize/' .
-                'vnameLen/vextraLen/vcommentLen/vdiskStart/vintAttr/VextAttr/VlocalHeaderOffset',
-                $header
-            );
-
-            $nameLen = $cd['nameLen'];
-            $extraLen = $cd['extraLen'];
-            $commentLen = $cd['commentLen'];
-            $name = substr($data, $pos + 46, $nameLen);
-
-            if ($name === $entryName) {
-                return self::readLocalEntry($data, $cd['localHeaderOffset'], $cd['method'], $cd['compSize'], $cd['uncompSize']);
-            }
-
-            $pos += 46 + $nameLen + $extraLen + $commentLen;
-        }
-
-        return false;
-    }
-
-    /** @return string|false */
-    private static function readLocalEntry(string $data, int $localOffset, int $method, int $compSize, int $uncompSize)
-    {
-        if (substr($data, $localOffset, 4) !== "\x50\x4b\x03\x04") {
-            return false;
-        }
-        $localHeader = substr($data, $localOffset, 30);
-        $lf = unpack('Vsig/vverNeed/vflag/vmethod/vmtime/vmdate/Vcrc/VcompSize/VuncompSize/vnameLen/vextraLen', $localHeader);
-
-        $dataStart = $localOffset + 30 + $lf['nameLen'] + $lf['extraLen'];
-        $useCompSize = $lf['compSize'] > 0 ? $lf['compSize'] : $compSize;
-        $compressedData = substr($data, $dataStart, $useCompSize);
-
-        if ($method === 0) {
-            return $compressedData; // STORED, sin compresión
-        }
-        if ($method === 8) {
-            $raw = @gzinflate($compressedData); // DEFLATE
-            return $raw === false ? false : $raw;
-        }
-
-        return false; // método de compresión no soportado (raro en .docx)
-    }
+function normalize_ws($text) {
+    $text = str_replace(["\r\n", "\r"], "\n", $text);
+    $text = preg_replace('/[ \t]+/', ' ', $text);
+    $text = preg_replace('/\n+/', ' ', $text);
+    $text = preg_replace('/ +/', ' ', $text);
+    return trim($text);
 }
 
-/* =====================================================================
- * CLASE: DocxExtractor
- * Extrae preguntas de un .docx detectando negrita/resaltado como marca
- * de la alternativa correcta.
- * ===================================================================== */
-class DocxExtractor
-{
-    public array $warnings = [];
+function safe_filename($name) {
+    $name = preg_replace('/\.[Dd][Oo][Cc][Xx]$/', '', $name);
+    $name = preg_replace('/[^A-Za-z0-9_\-\.]+/', '_', $name);
+    $name = trim($name, '_');
+    if ($name === '') $name = 'documento';
+    return $name;
+}
 
-    public function extract(string $filePath): array
-    {
-        $xml = $this->readDocumentXml($filePath);
+// ============================================================================
+//  PARSER DE DOCX -> ESTRUCTURA DE PREGUNTAS
+// ============================================================================
 
-        if ($xml === false || $xml === null) {
-            throw new RuntimeException('El .docx no contiene word/document.xml o no se pudo leer (¿está corrupto?).');
+class DocxAikenParser {
+
+    /** @var DOMXPath */
+    private $xpath;
+    /** @var array<string,bool> IDs de estilos de carácter que implican negrita */
+    private $boldStyleIds = [];
+    const NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+    const NS_MATH = 'http://schemas.openxmlformats.org/officeDocument/2006/math';
+    const CHECK_CHARS = ['✓', '✔', '☑', '✅', '☒'];
+
+    /**
+     * Lee word/styles.xml y devuelve el conjunto de styleId cuyo rPr define negrita,
+     * o cuyo nombre sugiere claramente negrita/énfasis (p.ej. "Textoennegrita", "Strong").
+     * Esto es necesario porque muchos documentos aplican la negrita mediante un estilo de
+     * carácter (<w:rStyle w:val="Textoennegrita"/>) en vez de un <w:b/> directo en el run.
+     */
+    private function extractBoldStyleIds($stylesXml) {
+        $ids = [];
+        if (!$stylesXml) return $ids;
+        $dom = new DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($stylesXml, LIBXML_NONET | LIBXML_NOENT);
+        libxml_clear_errors();
+        $xp = new DOMXPath($dom);
+        $xp->registerNamespace('w', self::NS);
+        foreach ($xp->query('//w:style[@w:type="character"]') as $style) {
+            $styleId = $style->getAttribute('w:styleId');
+            if ($styleId === '') continue;
+            $isBold = $xp->query('./w:rPr/w:b', $style)->length > 0;
+            $nameNode = $xp->query('./w:name', $style)->item(0);
+            $name = $nameNode ? strtolower($nameNode->getAttribute('w:val')) : '';
+            if ($isBold || strpos(strtolower($styleId), 'negrita') !== false
+                || strpos(strtolower($styleId), 'bold') !== false
+                || strpos($styleId, 'Strong') !== false
+                || strpos($name, 'negrita') !== false
+                || strpos($name, 'bold') !== false
+                || strpos($name, 'strong') !== false) {
+                $ids[$styleId] = true;
+            }
+        }
+        return $ids;
+    }
+
+    /**
+     * Analiza un archivo .docx y devuelve ['meta' => [...], 'questions' => [...]]
+     */
+    public function parse($filePath) {
+        $zip = new ZipArchive();
+        if ($zip->open($filePath) !== true) {
+            throw new Exception('No se pudo abrir el archivo .docx (¿está dañado?).');
+        }
+        $xml = $zip->getFromName('word/document.xml');
+        $stylesXml = $zip->getFromName('word/styles.xml');
+        $zip->close();
+        if ($xml === false) {
+            throw new Exception('El archivo no contiene word/document.xml (¿es un .docx válido?).');
         }
 
+        $this->boldStyleIds = $this->extractBoldStyleIds($stylesXml);
+
         $dom = new DOMDocument();
-        $dom->preserveWhiteSpace = true;
+        $dom->substituteEntities = false;
         libxml_use_internal_errors(true);
-        $dom->loadXML($xml);
+        $dom->loadXML($xml, LIBXML_NONET | LIBXML_NOENT);
         libxml_clear_errors();
 
         $xpath = new DOMXPath($dom);
-        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+        $xpath->registerNamespace('w', self::NS);
+        $xpath->registerNamespace('m', self::NS_MATH);
+        $this->xpath = $xpath;
 
-        $questions = $this->extractFromTables($dom, $xpath);
-
-        if (empty($questions)) {
-            $plainText = $this->documentToPlainText($dom, $xpath);
-            $questions = TextQuestionParser::parse($plainText, $this->warnings, false);
-        }
-
-        return $questions;
-    }
-
-    /**
-     * Lee word/document.xml del .docx. Usa ZipArchive si la extensión "zip"
-     * está disponible; si no, usa el lector ZIP puro en PHP (MiniZipReader).
-     * @return string|false|null
-     */
-    private function readDocumentXml(string $filePath)
-    {
-        if (class_exists('ZipArchive')) {
-            $zip = new ZipArchive();
-            if ($zip->open($filePath) === true) {
-                $xml = $zip->getFromName('word/document.xml');
-                $zip->close();
-                if ($xml !== false) {
-                    return $xml;
-                }
-                // Si ZipArchive no pudo leer la entrada, probamos el lector propio abajo.
-            }
-        }
-
-        if (!function_exists('gzinflate')) {
-            throw new RuntimeException(
-                'Este servidor no tiene ni la extensión "zip" ni la extensión "zlib" habilitadas, ' .
-                'y ambas son necesarias para leer archivos .docx. Pide a tu proveedor de hosting ' .
-                'que habilite alguna de las dos (zlib suele venir activada por defecto).'
-            );
-        }
-
-        return MiniZipReader::extract($filePath, 'word/document.xml');
-    }
-
-    private function extractFromTables(DOMDocument $dom, DOMXPath $xpath): array
-    {
+        $meta = [];
         $questions = [];
+
         $tables = $xpath->query('//w:tbl');
+        foreach ($tables as $tbl) {
+            $rows = $xpath->query('./w:tr', $tbl);
+            if ($rows->length === 0) continue;
 
-        foreach ($tables as $table) {
-            $rows = $xpath->query('.//w:tr', $table);
-
-            foreach ($rows as $row) {
-                $cells = $xpath->query('./w:tc', $row);
-                if ($cells->length < 2) {
-                    continue;
+            // Buscar la fila de encabezado real recorriendo TODAS las filas de la tabla,
+            // porque algunos formatos insertan una fila fusionada ("Tema 1-2") antes del
+            // encabezado verdadero (Nº / Preguntas / Opciones de respuesta).
+            $headerRowIdx = null; $colQuestion = null; $colOptions = null; $colNum = null;
+            for ($hr = 0; $hr < $rows->length; $hr++) {
+                $cells = $xpath->query('./w:tc', $rows->item($hr));
+                if ($cells->length < 2) continue;
+                $texts = [];
+                foreach ($cells as $tc) $texts[] = normalize_ws($this->cellText($tc));
+                $cq = null; $co = null; $cn = null;
+                foreach ($texts as $i => $t) {
+                    if (stripos($t, 'pregunta') !== false) $cq = $i;
+                    if (stripos($t, 'opci') !== false || stripos($t, 'respuesta') !== false) $co = $i;
+                    if (preg_match('/^n[°ºo]?\.?$/i', trim($t))) $cn = $i;
                 }
-
-                $cellsArr = iterator_to_array($cells);
-
-                foreach ($cellsArr as $ci => $cell) {
-                    $optionParas = $this->cellOptionParagraphs($xpath, $cell);
-                    if (count($optionParas) < 2) {
-                        continue;
-                    }
-
-                    $statementCell = null;
-                    for ($j = $ci - 1; $j >= 0; $j--) {
-                        $text = trim($this->cellPlainText($xpath, $cellsArr[$j]));
-                        if ($text !== '') {
-                            $statementCell = $cellsArr[$j];
-                            break;
-                        }
-                    }
-
-                    if ($statementCell === null) {
-                        continue;
-                    }
-
-                    $statement = $this->buildStatementText($xpath, $statementCell);
-
-                    if (mb_strtolower($statement) === 'preguntas' || mb_strlen($statement) < 3) {
-                        continue;
-                    }
-
-                    [$options, $correct] = $this->buildOptions($optionParas);
-
-                    if (count($options) < 2) {
-                        continue;
-                    }
-
-                    $questions[] = [
-                        'statement' => $this->normalizeSpaces($statement),
-                        'options'   => $options,
-                        'correct'   => $correct,
-                        'source'    => 'tabla',
-                    ];
-
+                if ($cq !== null && $co !== null) {
+                    $headerRowIdx = $hr; $colQuestion = $cq; $colOptions = $co; $colNum = $cn;
                     break;
                 }
             }
-        }
 
-        return $questions;
-    }
+            if ($headerRowIdx !== null) {
+                // Es una tabla de preguntas
+                for ($r = $headerRowIdx + 1; $r < $rows->length; $r++) {
+                    $cells = $xpath->query('./w:tc', $rows->item($r));
+                    if ($cells->length <= max($colQuestion, $colOptions)) continue;
+                    $qText = normalize_ws($this->cellText($cells->item($colQuestion)));
+                    if ($qText === '') continue;
+                    $opts = $this->parseOptionsCell($cells->item($colOptions));
+                    if (count($opts) < 2) continue;
 
-    private function cellOptionParagraphs(DOMXPath $xpath, DOMElement $cell): array
-    {
-        $paras = $xpath->query('./w:p', $cell);
-        $matches = [];
-        foreach ($paras as $p) {
-            $text = trim($this->paragraphText($xpath, $p));
-            if ($text === '') {
-                continue;
-            }
-            if (preg_match('/^[a-dA-D][\.\)]\s*.+/u', $text)) {
-                $matches[] = $p;
-            }
-        }
-        return $matches;
-    }
+                    [$correctIdx, $confident] = $this->detectCorrect($opts);
 
-    private function buildOptions(array $optionParagraphs): array
-    {
-        $options = [];
-        $highlightedLetters = [];
-        $boldLetters = [];
-
-        foreach ($optionParagraphs as $p) {
-            $xpath = new DOMXPath($p->ownerDocument);
-            $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
-
-            $text = trim($this->paragraphText($xpath, $p));
-            if (!preg_match('/^([a-dA-D])[\.\)]\s*(.+)$/us', $text, $m)) {
-                continue;
-            }
-            $letter = strtoupper($m[1]);
-            $optText = trim($m[2]);
-            $options[$letter] = $this->normalizeSpaces($optText);
-
-            $runs = $xpath->query('.//w:r', $p);
-            $hasHighlight = false;
-            $hasBold = false;
-            foreach ($runs as $run) {
-                $rPr = $xpath->query('./w:rPr', $run)->item(0);
-                if ($rPr === null) {
-                    continue;
-                }
-                if ($xpath->query('./w:highlight', $rPr)->length > 0) {
-                    $hl = $xpath->query('./w:highlight', $rPr)->item(0);
-                    $val = $hl->getAttribute('w:val');
-                    if ($val !== '' && $val !== 'none') {
-                        $hasHighlight = true;
+                    $declaredNum = null;
+                    if ($colNum !== null && $cells->length > $colNum) {
+                        $numText = normalize_ws($this->cellText($cells->item($colNum)));
+                        if (preg_match('/(\d{1,3})/', $numText, $mm)) $declaredNum = (int)$mm[1];
                     }
+
+                    $questions[] = [
+                        'text' => $qText,
+                        'options' => array_map(fn($o) => $o['text'], $opts),
+                        'correct' => $correctIdx,
+                        'confident' => $confident,
+                        'num' => $declaredNum,
+                        'source' => $confident ? 'inline' : 'none',
+                    ];
                 }
-                $boldNode = $xpath->query('./w:b', $rPr)->item(0);
-                if ($boldNode !== null) {
-                    $val = $boldNode->getAttribute('w:val');
-                    if ($val === '' || !in_array($val, ['0', 'false'], true)) {
-                        $hasBold = true;
+            } else {
+                // No es una tabla de preguntas: puede ser una tabla de metadatos
+                // (Experiencia curricular | valor, Semana | valor, etc.) con filas de 2 columnas.
+                foreach ($rows as $row) {
+                    $cells = $xpath->query('./w:tc', $row);
+                    if ($cells->length === 2) {
+                        $label = normalize_ws($this->cellText($cells->item(0)));
+                        $value = normalize_ws($this->cellText($cells->item(1)));
+                        if ($label !== '' && strlen($label) < 60) $meta[$label] = $value;
                     }
                 }
             }
-
-            if ($hasHighlight) {
-                $highlightedLetters[] = $letter;
-            }
-            if ($hasBold) {
-                $boldLetters[] = $letter;
-            }
         }
 
-        $correct = null;
-        if (count($highlightedLetters) === 1) {
-            $correct = $highlightedLetters[0];
-        } elseif (count($highlightedLetters) === 0 && count($boldLetters) === 1) {
-            $correct = $boldLetters[0];
-        } else {
-            $correct = null;
-        }
-
-        return [$options, $correct];
-    }
-
-    private function cellPlainText(DOMXPath $xpath, DOMElement $cell): string
-    {
-        $paras = $xpath->query('./w:p', $cell);
-        $lines = [];
-        foreach ($paras as $p) {
-            $t = trim($this->paragraphText($xpath, $p));
-            if ($t !== '') {
-                $lines[] = $t;
-            }
-        }
-        return implode("\n", $lines);
-    }
-
-    private function cellLines(DOMXPath $xpath, DOMElement $cell): array
-    {
-        $paras = $xpath->query('./w:p', $cell);
-        $lines = [];
-        foreach ($paras as $p) {
-            foreach ($this->paragraphTextLines($xpath, $p) as $l) {
-                if ($l !== '') {
-                    $lines[] = $l;
+        // ------------------------------------------------------------------
+        // Respaldo: algunos docentes no marcan la opción correcta dentro de la
+        // tabla, sino que agregan al final del documento una "clave de
+        // respuestas" en texto plano, p.ej.:
+        //   "CLAVE RÁPIDA DE RESPUESTAS  01: b  02: c  03: c ..."
+        // Si existe, se usa para completar automáticamente las preguntas que
+        // no tuvieron una marca confiable dentro de la tabla.
+        // ------------------------------------------------------------------
+        $answerKeyMap = $this->extractAnswerKeyFromText($dom);
+        if (!empty($answerKeyMap)) {
+            foreach ($questions as $i => &$q) {
+                if ($q['confident']) continue;
+                $lookupNum = $q['num'] ?? ($i + 1);
+                if (isset($answerKeyMap[$lookupNum]) && $answerKeyMap[$lookupNum] < count($q['options'])) {
+                    $q['correct'] = $answerKeyMap[$lookupNum];
+                    $q['confident'] = true;
+                    $q['source'] = 'clave_final';
                 }
             }
+            unset($q);
         }
-        return $lines;
+
+        return ['meta' => $meta, 'questions' => $questions];
+    }
+
+    /** Quita tildes comunes del español (sin depender de mbstring) */
+    private function unaccent($s) {
+        $map = [
+            'á'=>'a','é'=>'e','í'=>'i','ó'=>'o','ú'=>'u','ü'=>'u','ñ'=>'n',
+            'Á'=>'A','É'=>'E','Í'=>'I','Ó'=>'O','Ú'=>'U','Ü'=>'U','Ñ'=>'N',
+        ];
+        return strtr($s, $map);
     }
 
     /**
-     * Arma el texto del enunciado a partir de una celda de "Preguntas",
-     * descartando la línea de etiqueta/categoría (p. ej. "Conceptual · LP",
-     * "Análisis · LC1", "Aplicación · LC1–LC2") que suele venir en un
-     * párrafo separado antes de la pregunta real. No se toca el contenido
-     * de la pregunta en sí: solo se excluye esa línea de clasificación
-     * interna, que no forma parte del enunciado.
+     * Busca en TODO el texto del documento (fuera de las tablas también) una
+     * sección tipo "Clave de respuestas" / "Solucionario" / "Hoja de
+     * respuestas" y extrae pares número:letra (ej. "01: b", "12) A").
+     * Devuelve [numeroPregunta => indiceOpcion(0=A,1=B,...)] o [] si no hay.
      */
-    private function buildStatementText(DOMXPath $xpath, DOMElement $cell): string
-    {
-        $lines = $this->cellLines($xpath, $cell);
-        $lines = $this->stripTagLines($lines);
-        return $this->normalizeSpaces(implode(' ', $lines));
-    }
+    private function extractAnswerKeyFromText($dom) {
+        $allText = [];
+        foreach ($this->xpath->query('//w:t') as $t) $allText[] = $t->textContent;
+        $flat = strtolower($this->unaccent(implode(' ', $allText)));
 
-    /**
-     * Elimina, del inicio del array de líneas, cualquier línea que tenga
-     * forma de etiqueta de clasificación en vez de pregunta: texto corto,
-     * sin signo de interrogación/punto final de oración, que contiene un
-     * separador tipo "·" seguido de un código (LP, LC1, LC2, LC1–LC2...).
-     * Solo actúa si hay más líneas después (para no vaciar el enunciado).
-     */
-    private function stripTagLines(array $lines): array
-    {
-        while (count($lines) > 1) {
-            $first = trim($lines[0]);
-
-            $looksLikeTag =
-                mb_strlen($first) <= 60 &&
-                (mb_strpos($first, '·') !== false || preg_match('/^\p{L}+\s*[-–]\s*L[PC]\d*/u', $first)) &&
-                !preg_match('/[?¿.:!]/u', $first);
-
-            if (!$looksLikeTag) {
-                break;
-            }
-
-            array_shift($lines);
+        if (!preg_match(
+            '/(clave\s*(rapida)?\s*de\s*respuestas|respuestas?\s*correctas|hoja\s*de\s*respuestas|solucionario|clave\s*de\s*correccion)/',
+            $flat, $m, PREG_OFFSET_CAPTURE
+        )) {
+            return [];
         }
+        $tail = substr($flat, $m[0][1] + strlen($m[0][0]));
 
-        return $lines;
-    }
-
-    private function paragraphText(DOMXPath $xpath, DOMElement $p): string
-    {
-        // Incluye <w:t> (texto) y trata <w:br/>/<w:tab/> como espacio, para
-        // no pegar palabras cuando el autor usó un salto de línea manual
-        // (Shift+Enter) dentro del mismo párrafo en vez de un párrafo nuevo.
-        $nodes = $xpath->query('.//w:t | .//w:br | .//w:tab', $p);
-        $out = '';
-        foreach ($nodes as $node) {
-            if ($node->nodeName === 'w:t') {
-                $out .= $node->textContent;
-            } else {
-                $out .= ' ';
-            }
-        }
-        return $out;
-    }
-
-    /**
-     * Igual que paragraphText, pero devuelve un array de "líneas" separando
-     * por los saltos de línea manuales (<w:br/> o <w:cr/>) dentro del
-     * párrafo. Se usa para poder detectar y descartar una línea de
-     * etiqueta/categoría aunque esté en el MISMO párrafo que la pregunta
-     * (autores que usan Shift+Enter en vez de Enter).
-     * @return string[]
-     */
-    private function paragraphTextLines(DOMXPath $xpath, DOMElement $p): array
-    {
-        $nodes = $xpath->query('.//w:t | .//w:br | .//w:cr', $p);
-        $lines = [];
-        $current = '';
-        foreach ($nodes as $node) {
-            if ($node->nodeName === 'w:t') {
-                $current .= $node->textContent;
-            } else {
-                $lines[] = trim($current);
-                $current = '';
-            }
-        }
-        $lines[] = trim($current);
-        return $lines;
-    }
-
-    private function normalizeSpaces(string $s): string
-    {
-        $s = preg_replace('/\s+/u', ' ', $s);
-        return trim($s);
-    }
-
-    private function documentToPlainText(DOMDocument $dom, DOMXPath $xpath): string
-    {
-        $paras = $xpath->query('//w:body/w:p');
-        $lines = [];
-        foreach ($paras as $p) {
-            $lines[] = trim($this->paragraphText($xpath, $p));
-        }
-        return implode("\n", $lines);
-    }
-}
-
-/* =====================================================================
- * CLASE: TextQuestionParser
- * Parser heurístico de preguntas a partir de texto plano (PDF y fallback
- * de DOCX sin tablas).
- * ===================================================================== */
-class TextQuestionParser
-{
-    public static function parse(string $text, array &$warnings, bool $numberedQuestions = true): array
-    {
-        $lines = preg_split('/\r\n|\r|\n/', $text);
-        $lines = array_map('rtrim', $lines);
-
-        [$bodyLines, $answerKey] = self::splitAnswerKeyBlock($lines);
-        $blocks = self::splitIntoQuestionBlocks($bodyLines, $numberedQuestions);
-
-        $questions = [];
-        $qNumber = 0;
-        foreach ($blocks as $block) {
-            $qNumber++;
-            $parsed = self::parseBlock($block);
-            if ($parsed === null) {
-                continue;
-            }
-            [$statement, $options, $correct] = $parsed;
-
-            if ($correct === null && isset($answerKey[$qNumber])) {
-                $letter = strtoupper($answerKey[$qNumber]);
-                if (isset($options[$letter])) {
-                    $correct = $letter;
-                }
-            }
-
-            if (count($options) < 2) {
-                continue;
-            }
-
-            if ($correct === null) {
-                $warnings[] = "Pregunta #{$qNumber}: no se detectó la alternativa correcta automáticamente. Revísala manualmente en el archivo generado (quedó marcada como 'A' por defecto).";
-            }
-
-            $questions[] = [
-                'statement' => $statement,
-                'options'   => $options,
-                'correct'   => $correct,
-                'source'    => 'texto',
-            ];
-        }
-
-        return $questions;
-    }
-
-    private static function splitAnswerKeyBlock(array $lines): array
-    {
-        $keyStart = null;
-        foreach ($lines as $i => $line) {
-            if (preg_match('/^\s*(clave\s+de\s+respuestas|clave\s+de\s+resp\.?|respuestas\s+correctas|hoja\s+de\s+respuestas|answer\s+key)\s*:?\s*$/iu', $line)) {
-                $keyStart = $i;
-                break;
-            }
-        }
-
-        if ($keyStart === null) {
-            return [$lines, []];
-        }
-
-        $keyText = implode(' ', array_slice($lines, $keyStart + 1));
         $map = [];
-        if (preg_match_all('/(\d{1,3})\s*[\.\)\-:]\s*([a-fA-F])\b/u', $keyText, $m, PREG_SET_ORDER)) {
-            foreach ($m as $pair) {
-                $map[(int)$pair[1]] = strtoupper($pair[2]);
+        if (preg_match_all('/\b(\d{1,3})\s*[:\.\-\)]\s*([a-h])\b/', $tail, $mm, PREG_SET_ORDER)) {
+            foreach ($mm as $pair) {
+                $num = (int)$pair[1];
+                $letterIdx = ord($pair[2]) - ord('a');
+                $map[$num] = $letterIdx;
             }
         }
-
-        $remaining = array_slice($lines, 0, $keyStart);
-        return [$remaining, $map];
+        return $map;
     }
 
-    private static function splitIntoQuestionBlocks(array $lines, bool $numberedQuestions): array
-    {
-        $blocks = [];
-        $current = [];
+    /** Texto plano de una celda (todas las corridas de texto separadas por espacio) */
+    private function cellText($cell) {
+        $texts = [];
+        foreach ($this->xpath->query('.//w:t', $cell) as $t) $texts[] = $t->textContent;
+        return implode(' ', $texts);
+    }
 
-        $isNewQuestionStart = function (string $line) use ($numberedQuestions): bool {
-            if (trim($line) === '') {
-                return false;
+    /**
+     * Convierte los <w:p> (párrafos) de una corrida de texto en una lista de "tokens"
+     * ordenados: ['type'=>'text','text'=>..,'bold'=>bool,'highlight'=>bool] o ['type'=>'break']
+     */
+    private function flattenParagraph($p) {
+        $tokens = [];
+        foreach ($p->childNodes as $node) {
+            if ($node->nodeType !== XML_ELEMENT_NODE) continue;
+            $localName = $node->localName;
+
+            if ($localName === 'r') {
+                $run = $node;
+                $bold = false; $highlight = false;
+                $rprList = $this->xpath->query('./w:rPr', $run);
+                if ($rprList->length > 0) {
+                    $rpr = $rprList->item(0);
+                    $bNodes = $this->xpath->query('./w:b', $rpr);
+                    if ($bNodes->length > 0) {
+                        $val = $bNodes->item(0)->getAttribute('w:val');
+                        $bold = ($val === '' || strtolower($val) === 'true' || $val === '1');
+                    }
+                    // Negrita aplicada mediante un estilo de carácter (w:rStyle) en vez de w:b directo
+                    $rStyleNodes = $this->xpath->query('./w:rStyle', $rpr);
+                    if ($rStyleNodes->length > 0) {
+                        $styleId = $rStyleNodes->item(0)->getAttribute('w:val');
+                        if (isset($this->boldStyleIds[$styleId])) $bold = true;
+                    }
+                    $hlNodes = $this->xpath->query('./w:highlight', $rpr);
+                    if ($hlNodes->length > 0) {
+                        $hv = strtolower($hlNodes->item(0)->getAttribute('w:val'));
+                        $highlight = ($hv !== '' && $hv !== 'none');
+                    }
+                }
+                foreach ($run->childNodes as $child) {
+                    if ($child->nodeType !== XML_ELEMENT_NODE) continue;
+                    $ln = $child->localName;
+                    if ($ln === 't') {
+                        $tokens[] = ['type' => 'text', 'text' => $child->textContent, 'bold' => $bold, 'highlight' => $highlight];
+                    } elseif ($ln === 'br') {
+                        $tokens[] = ['type' => 'break'];
+                    } elseif ($ln === 'tab') {
+                        $tokens[] = ['type' => 'text', 'text' => ' ', 'bold' => $bold, 'highlight' => $highlight];
+                    }
+                }
+            } elseif ($localName === 'oMath' || $localName === 'oMathPara') {
+                // Fórmulas matemáticas (Ecuaciones de Word): se extrae su texto plano (m:t)
+                // como contenido normal, sin negrita/resaltado (caso poco común de marcar
+                // la respuesta correcta dentro de una fórmula).
+                foreach ($this->xpath->query('.//m:t', $node) as $mt) {
+                    $tokens[] = ['type' => 'text', 'text' => $mt->textContent, 'bold' => false, 'highlight' => false];
+                }
             }
-            if ($numberedQuestions && preg_match('/^\s*\d{1,3}\s*[\.\)]\s*\S/u', $line)) {
-                return true;
+        }
+        return $tokens;
+    }
+
+    /**
+     * Analiza la celda de "Opciones de respuesta" y devuelve una lista ordenada de opciones:
+     * [ ['text'=>.., 'highlight'=>bool, 'bold'=>bool, 'check'=>bool], ... ]
+     */
+    private function parseOptionsCell($cell) {
+        $paragraphs = $this->xpath->query('./w:p', $cell);
+        $segments = [];
+        $markerRegex = '/^\s*[\(\[]?[A-Za-z0-9][\.\)\]]\s+/u';
+
+        $flush = function ($tokens, $fromNumPr = false) use (&$segments, $markerRegex) {
+            $text = '';
+            foreach ($tokens as $tok) {
+                if ($tok['type'] !== 'text') continue;
+                $text .= $tok['text'];
             }
-            return false;
+            $plain = normalize_ws($text);
+            if ($plain === '') return;
+
+            // Determinar a partir de qué desplazamiento (en la cadena SIN normalizar)
+            // empieza el contenido real de la opción, saltando el marcador "a) " / "b." / etc.
+            $markerLen = 0;
+            if (preg_match($markerRegex, $text, $m)) $markerLen = strlen($m[0]);
+
+            $offset = 0; $anyText = false; $allBold = true; $anyHighlight = false;
+            foreach ($tokens as $tok) {
+                if ($tok['type'] !== 'text') continue;
+                $len = strlen($tok['text']);
+                $tokEnd = $offset + $len;
+                // Sólo se evalúa el formato de la parte del token que cae DESPUÉS del marcador.
+                $overlapAfterMarker = $tokEnd - max($offset, $markerLen);
+                if ($overlapAfterMarker > 0 && trim($tok['text']) !== '') {
+                    $anyText = true;
+                    if (empty($tok['bold'])) $allBold = false;
+                    if (!empty($tok['highlight'])) $anyHighlight = true;
+                }
+                $offset = $tokEnd;
+            }
+            $segments[] = ['raw' => $plain, 'highlight' => $anyHighlight, 'bold' => ($anyText && $allBold), 'fromNumPr' => $fromNumPr];
         };
 
-        foreach ($lines as $line) {
-            if ($isNewQuestionStart($line)) {
-                if (!empty($current)) {
-                    $blocks[] = $current;
-                }
-                $current = [$line];
+        foreach ($paragraphs as $p) {
+            $pPrList = $this->xpath->query('./w:pPr', $p);
+            $hasNumPr = false;
+            if ($pPrList->length > 0) {
+                $hasNumPr = $this->xpath->query('./w:numPr', $pPrList->item(0))->length > 0;
+            }
+            $tokens = $this->flattenParagraph($p);
+            if (empty($tokens)) continue;
+
+            if ($hasNumPr) {
+                // Cada párrafo con numeración automática (a, b, c...) es UNA opción completa
+                $flush($tokens, true);
             } else {
-                $current[] = $line;
-            }
-        }
-        if (!empty($current)) {
-            $blocks[] = $current;
-        }
-
-        if (!$numberedQuestions) {
-            $blocks = self::splitByBlankLinesWithOptions($lines);
-        }
-
-        return $blocks;
-    }
-
-    private static function splitByBlankLinesWithOptions(array $lines): array
-    {
-        $blocks = [];
-        $current = [];
-        foreach ($lines as $line) {
-            if (trim($line) === '' && !empty($current)) {
-                $blocks[] = $current;
-                $current = [];
-                continue;
-            }
-            if (trim($line) !== '') {
-                $current[] = $line;
-            }
-        }
-        if (!empty($current)) {
-            $blocks[] = $current;
-        }
-        return $blocks;
-    }
-
-    private static function parseBlock(array $block): ?array
-    {
-        $statementLines = [];
-        $options = [];
-        $correct = null;
-        $inOptions = false;
-
-        foreach ($block as $line) {
-            $trimmed = trim($line);
-            if ($trimmed === '') {
-                continue;
-            }
-
-            if (!$inOptions) {
-                $trimmed = preg_replace('/^\s*\d{1,3}\s*[\.\)]\s*/u', '', $trimmed);
-            }
-
-            if (preg_match('/^(\*?)([a-fA-F])[\.\)]\s*(.+?)(\s*\(correcta\)|\s*\(CORRECTA\)|\s*[✓√]\s*)?$/u', $trimmed, $m)) {
-                $inOptions = true;
-                $hasAsterisk = $m[1] === '*';
-                $letter = strtoupper($m[2]);
-                $optText = trim($m[3]);
-                $hasMarker = isset($m[4]) && trim($m[4]) !== '';
-
-                $options[$letter] = $optText;
-                if ($hasAsterisk || $hasMarker) {
-                    $correct = $letter;
+                // Puede haber varias opciones separadas por <w:br/> dentro del mismo párrafo.
+                // Sólo se corta en el salto de línea si lo que sigue empieza con "a)", "b.", etc.
+                $buffer = [];
+                $n = count($tokens);
+                for ($i = 0; $i < $n; $i++) {
+                    $tok = $tokens[$i];
+                    if ($tok['type'] === 'break') {
+                        $j = $i + 1; $nextText = '';
+                        while ($j < $n && $tokens[$j]['type'] !== 'text') $j++;
+                        if ($j < $n) $nextText = $tokens[$j]['text'];
+                        if (preg_match($markerRegex, $nextText)) {
+                            $flush($buffer);
+                            $buffer = [];
+                        } else {
+                            $buffer[] = ['type' => 'text', 'text' => ' ', 'bold' => false, 'highlight' => false];
+                        }
+                    } else {
+                        $buffer[] = $tok;
+                    }
                 }
-                continue;
-            }
-
-            if (!$inOptions) {
-                $statementLines[] = $trimmed;
+                if (!empty($buffer)) $flush($buffer);
             }
         }
 
-        $statement = trim(preg_replace('/\s+/u', ' ', implode(' ', $statementLines)));
-
-        if ($statement === '' || count($options) < 2) {
-            return null;
+        // Limpieza final: quitar marcador de letra ("a)", "B.", "(c)"...) y detectar símbolo de check.
+        // Se descartan segmentos sueltos que NO tengan marcador de opción y no vengan de una lista
+        // numerada automática (típicamente texto explicativo suelto, p.ej. "Cálculo: ...").
+        $options = [];
+        foreach ($segments as $seg) {
+            if (!$seg['fromNumPr'] && !preg_match($markerRegex, $seg['raw'])) continue;
+            $text = $seg['raw'];
+            $hasCheck = false;
+            foreach (self::CHECK_CHARS as $c) {
+                if (strpos($text, $c) !== false) {
+                    $hasCheck = true;
+                    $text = str_replace($c, '', $text);
+                }
+            }
+            $text = preg_replace($markerRegex, '', $text, 1);
+            $text = trim(normalize_ws($text));
+            if ($text === '') continue;
+            $options[] = ['text' => $text, 'highlight' => $seg['highlight'], 'bold' => $seg['bold'], 'check' => $hasCheck];
         }
+        return $options;
+    }
 
-        return [$statement, $options, $correct];
+    /**
+     * Determina qué opción es la correcta.
+     * Prioridad: símbolo ✓  >  resaltado (highlight)  >  negrita en contraste  >  indeterminado.
+     * Devuelve [indice, confiable(bool)]
+     */
+    private function detectCorrect($opts) {
+        foreach ($opts as $i => $o) if ($o['check']) return [$i, true];
+        foreach ($opts as $i => $o) if ($o['highlight']) return [$i, true];
+
+        $boldIdx = [];
+        foreach ($opts as $i => $o) if ($o['bold']) $boldIdx[] = $i;
+        if (count($boldIdx) >= 1 && count($boldIdx) < count($opts)) {
+            return [$boldIdx[0], true];
+        }
+        return [0, false];
     }
 }
 
-/* =====================================================================
- * CLASE: PdfExtractor
- * Extrae texto de un PDF vía pdftotext (poppler-utils).
- * ===================================================================== */
-class PdfExtractor
-{
-    public array $warnings = [];
+// ============================================================================
+//  GENERADOR AIKEN
+// ============================================================================
 
-    public function extractPlainText(string $filePath): string
-    {
-        if (!self::pdftotextAvailable()) {
-            throw new RuntimeException(
-                'Este servidor no tiene instalada la utilidad "pdftotext" (paquete poppler-utils), ' .
-                'necesaria para leer archivos PDF. Instálala con: apt-get install poppler-utils ' .
-                '— o bien exporta tu documento a Word (.docx), que sí es totalmente compatible.'
-            );
+function question_to_aiken($q, $letters) {
+    $lines = [];
+    $lines[] = $q['text'];
+    foreach ($q['options'] as $i => $opt) {
+        $letter = $letters[$i] ?? chr(65 + $i);
+        $lines[] = $letter . ') ' . $opt;
+    }
+    $correctLetter = $letters[$q['correct']] ?? 'A';
+    $lines[] = 'ANSWER: ' . $correctLetter;
+    return implode("\n", $lines);
+}
+
+function batch_to_aiken($questions, $letters) {
+    $blocks = [];
+    foreach ($questions as $q) $blocks[] = question_to_aiken($q, $letters);
+    return implode("\n\n", $blocks) . "\n";
+}
+
+function guess_unit_label($meta, $fallback) {
+    $keys = array_keys($meta);
+    $exp = null; $ses = null;
+    foreach ($keys as $k) {
+        $kl = strtolower($k);
+        if (strpos($kl, 'experiencia') !== false) $exp = $meta[$k];
+        if (strpos($kl, 'sesi') !== false || strpos($kl, 'semana') !== false) $ses = $meta[$k];
+    }
+    $parts = array_filter([$exp, $ses ? ('Sesión/Semana ' . $ses) : null]);
+    return $parts ? implode(' — ', $parts) : $fallback;
+}
+
+// ============================================================================
+//  MANEJO DE ACCIONES (POST)
+// ============================================================================
+
+$errors = [];
+$action = $_POST['action'] ?? '';
+
+// --- 1) Subida y procesamiento de archivos ---------------------------------
+if ($action === 'upload' && !empty($_FILES['docs']['name'][0])) {
+    $batches = [];
+    $count = count($_FILES['docs']['name']);
+    if ($count > MAX_FILES) $count = MAX_FILES;
+
+    for ($i = 0; $i < $count; $i++) {
+        if ($_FILES['docs']['error'][$i] !== UPLOAD_ERR_OK) {
+            $errors[] = 'Error al subir "' . htmlspecialchars($_FILES['docs']['name'][$i]) . '".';
+            continue;
         }
-
-        $out = $filePath . '.txt';
-        $cmd = 'pdftotext -layout ' . escapeshellarg($filePath) . ' ' . escapeshellarg($out) . ' 2>&1';
-        exec($cmd, $outputLines, $returnCode);
-
-        if ($returnCode !== 0 || !file_exists($out)) {
-            throw new RuntimeException('No se pudo extraer texto del PDF: ' . implode(' ', $outputLines));
+        $origName = $_FILES['docs']['name'][$i];
+        $tmpPath = $_FILES['docs']['tmp_name'][$i];
+        if (strtolower(pathinfo($origName, PATHINFO_EXTENSION)) !== 'docx') {
+            $errors[] = '"' . htmlspecialchars($origName) . '" no es un archivo .docx y fue omitido.';
+            continue;
         }
-
-        $text = file_get_contents($out);
-        @unlink($out);
-
-        return $text === false ? '' : $text;
+        try {
+            $parser = new DocxAikenParser();
+            $result = $parser->parse($tmpPath);
+            if (empty($result['questions'])) {
+                $errors[] = 'No se detectaron preguntas en "' . htmlspecialchars($origName) . '". Revisa el formato del documento.';
+                continue;
+            }
+            $batches[] = [
+                'filename' => $origName,
+                'label' => guess_unit_label($result['meta'], $origName),
+                'meta' => $result['meta'],
+                'questions' => $result['questions'],
+            ];
+        } catch (Exception $e) {
+            $errors[] = 'Error procesando "' . htmlspecialchars($origName) . '": ' . htmlspecialchars($e->getMessage());
+        }
     }
 
-    public function extract(string $filePath): array
-    {
-        $text = $this->extractPlainText($filePath);
-        return TextQuestionParser::parse($text, $this->warnings, true);
-    }
-
-    public static function pdftotextAvailable(): bool
-    {
-        $path = trim((string) shell_exec('command -v pdftotext 2>/dev/null'));
-        return $path !== '';
+    if (!empty($batches)) {
+        $_SESSION['batches'] = $batches;
     }
 }
 
-/* =====================================================================
- * CLASE: AikenConverter
- * Convierte preguntas estructuradas al formato AIKEN de Moodle.
- * ===================================================================== */
-class AikenConverter
-{
-    public static function toAiken(array $questions): string
-    {
-        $out = [];
+// --- 2) Reiniciar -----------------------------------------------------------
+if ($action === 'reset') {
+    unset($_SESSION['batches']);
+    header('Location: ' . $_SERVER['PHP_SELF']);
+    exit;
+}
 
-        foreach ($questions as $q) {
-            $statement = self::sanitizeLine($q['statement']);
-            if ($statement === '') {
-                continue;
+// --- 3) Aplicar ediciones manuales de respuesta correcta --------------------
+if (in_array($action, ['save', 'download_unit', 'download_zip', 'download_combined']) && !empty($_SESSION['batches'])) {
+    foreach ($_SESSION['batches'] as $bi => &$batch) {
+        foreach ($batch['questions'] as $qi => &$q) {
+            $field = "ans_{$bi}_{$qi}";
+            if (isset($_POST[$field])) {
+                $letterIdx = array_search($_POST[$field], $OPTION_LETTERS, true);
+                if ($letterIdx !== false && $letterIdx < count($q['options'])) {
+                    if ($letterIdx !== ($q['correct'] ?? null) || empty($q['confident'])) {
+                        $q['source'] = 'manual';
+                    }
+                    $q['correct'] = $letterIdx;
+                    $q['confident'] = true;
+                }
             }
-
-            $letters = array_keys($q['options']);
-            sort($letters);
-
-            if (count($letters) < 2) {
-                continue;
-            }
-
-            $out[] = $statement;
-            foreach ($letters as $letter) {
-                $optText = self::sanitizeLine($q['options'][$letter]);
-                $out[] = $letter . '. ' . $optText;
-            }
-
-            $correct = $q['correct'];
-            if ($correct === null || !in_array($correct, $letters, true)) {
-                $correct = $letters[0];
-            }
-
-            $out[] = 'ANSWER: ' . $correct;
-            $out[] = '';
         }
-
-        return implode("\n", $out);
+        unset($q);
     }
+    unset($batch);
+}
 
-    private static function sanitizeLine(string $text): string
-    {
-        $text = str_replace(["\r\n", "\r", "\n"], ' ', $text);
-        $text = preg_replace('/\s+/u', ' ', $text);
-        return trim($text);
+// --- 4) Descargas ------------------------------------------------------------
+if ($action === 'download_unit' && !empty($_SESSION['batches'])) {
+    $idx = (int)($_POST['batch_index'] ?? -1);
+    if (isset($_SESSION['batches'][$idx])) {
+        $batch = $_SESSION['batches'][$idx];
+        $content = batch_to_aiken($batch['questions'], $OPTION_LETTERS);
+        $fname = safe_filename($batch['filename']) . '.txt';
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $fname . '"');
+        header('Content-Length: ' . strlen($content));
+        echo $content;
+        exit;
     }
 }
 
-/* =====================================================================
- * LÓGICA DE LA PÁGINA (subida, procesamiento, descarga)
- * ===================================================================== */
-$error = null;
-$result = null;
-
-if (isset($_GET['download']) && isset($_SESSION['aiken_file']) && isset($_SESSION['aiken_name'])) {
-    $content = $_SESSION['aiken_file'];
-    $name = $_SESSION['aiken_name'];
+if ($action === 'download_combined' && !empty($_SESSION['batches'])) {
+    $allQuestions = [];
+    foreach ($_SESSION['batches'] as $batch) {
+        foreach ($batch['questions'] as $q) $allQuestions[] = $q;
+    }
+    $content = batch_to_aiken($allQuestions, $OPTION_LETTERS);
     header('Content-Type: text/plain; charset=utf-8');
-    header('Content-Disposition: attachment; filename="' . $name . '"');
+    header('Content-Disposition: attachment; filename="preguntas_conjunto_aiken.txt"');
     header('Content-Length: ' . strlen($content));
     echo $content;
     exit;
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['banco'])) {
-    try {
-        $file = $_FILES['banco'];
-
-        if ($file['error'] !== UPLOAD_ERR_OK) {
-            throw new RuntimeException('Error al subir el archivo (código ' . $file['error'] . ').');
+if ($action === 'download_zip' && !empty($_SESSION['batches'])) {
+    $tmpZip = tempnam(sys_get_temp_dir(), 'aiken_') . '.zip';
+    $zip = new ZipArchive();
+    if ($zip->open($tmpZip, ZipArchive::CREATE | ZipArchive::OVERWRITE) === true) {
+        $used = [];
+        foreach ($_SESSION['batches'] as $batch) {
+            $content = batch_to_aiken($batch['questions'], $OPTION_LETTERS);
+            $base = safe_filename($batch['filename']);
+            $fname = $base . '.txt';
+            $n = 1;
+            while (in_array($fname, $used)) { $fname = $base . '_' . (++$n) . '.txt'; }
+            $used[] = $fname;
+            $zip->addFromString($fname, $content);
         }
-        if ($file['size'] > MAX_FILE_SIZE) {
-            throw new RuntimeException('El archivo supera el tamaño máximo permitido (20 MB).');
-        }
+        $zip->close();
 
-        $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-        $tmpPath = $file['tmp_name'];
-        $warnings = [];
+        header('Content-Type: application/zip');
+        header('Content-Disposition: attachment; filename="preguntas_por_unidad_aiken.zip"');
+        header('Content-Length: ' . filesize($tmpZip));
+        readfile($tmpZip);
+        unlink($tmpZip);
+        exit;
+    } else {
+        $errors[] = 'No se pudo generar el archivo ZIP.';
+    }
+}
 
-        if ($ext === 'docx') {
-            $extractor = new DocxExtractor();
-            $questions = $extractor->extract($tmpPath);
-            $warnings = $extractor->warnings;
-        } elseif ($ext === 'pdf') {
-            $extractor = new PdfExtractor();
-            $questions = $extractor->extract($tmpPath);
-            $warnings = $extractor->warnings;
-        } elseif ($ext === 'doc') {
-            throw new RuntimeException('El formato .doc antiguo no es compatible. Guarda el archivo como .docx desde Word y vuelve a intentarlo.');
-        } else {
-            throw new RuntimeException('Formato no compatible. Sube un archivo .docx o .pdf.');
-        }
+$batches = $_SESSION['batches'] ?? [];
 
-        if (empty($questions)) {
-            throw new RuntimeException(
-                'No se detectó ninguna pregunta con alternativas en el documento. ' .
-                'Verifica que las alternativas empiecen con "a.", "b.", "c." ... y que el enunciado esté antes de ellas.'
-            );
-        }
-
-        foreach ($questions as $i => $q) {
-            if ($q['correct'] === null) {
-                $num = $i + 1;
-                $preview = mb_substr($q['statement'], 0, 80);
-                $warnings[] = "Pregunta #{$num}: no se pudo determinar la alternativa correcta automáticamente (\"{$preview}...\"). Se marcó \"A\" por defecto: revísala en el archivo generado.";
-            }
-        }
-
-        $aikenText = AikenConverter::toAiken($questions);
-        $baseName = pathinfo($file['name'], PATHINFO_FILENAME);
-        $downloadName = preg_replace('/[^A-Za-z0-9_\-]+/', '_', $baseName) . '_AIKEN.txt';
-
-        $_SESSION['aiken_file'] = $aikenText;
-        $_SESSION['aiken_name'] = $downloadName;
-
-        $result = [
-            'count'    => count($questions),
-            'warnings' => $warnings,
-            'filename' => $downloadName,
-            'preview'  => mb_substr($aikenText, 0, 1500),
-        ];
-    } catch (Throwable $e) {
-        $error = $e->getMessage();
+// Estadísticas rápidas
+$totalQuestions = 0; $totalUnsure = 0;
+foreach ($batches as $b) {
+    foreach ($b['questions'] as $q) {
+        $totalQuestions++;
+        if (empty($q['confident'])) $totalUnsure++;
     }
 }
 ?>
@@ -800,125 +616,222 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['banco'])) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Conversor Word/PDF → AIKEN (Moodle)</title>
+<title><?php echo APP_TITLE; ?></title>
 <style>
-  :root{
-    --bg:#0f172a; --card:#ffffff; --accent:#2563eb; --accent-dark:#1d4ed8;
-    --text:#1e293b; --muted:#64748b; --ok:#16a34a; --warn:#b45309; --err:#dc2626;
-    --border:#e2e8f0;
+  :root {
+    --primary: #2f5496;
+    --primary-dark: #1f3a6e;
+    --ok: #2e7d32;
+    --warn: #b45309;
+    --warn-bg: #fff7e6;
+    --border: #d8dce3;
+    --bg: #f4f6f9;
   }
-  *{box-sizing:border-box;}
-  body{
-    margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    background:linear-gradient(180deg,#0f172a 0%, #1e293b 260px, #f1f5f9 260px);
-    color:var(--text); min-height:100vh;
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg);
+    margin: 0;
+    color: #202124;
   }
-  .wrap{max-width:760px;margin:0 auto;padding:32px 20px 80px;}
-  h1{color:#fff;font-size:1.6rem;margin:0 0 6px;}
-  .subtitle{color:#cbd5e1;font-size:.95rem;margin:0 0 28px;}
-  .card{background:var(--card);border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.12);padding:28px;margin-bottom:20px;}
-  label.dropzone{
-    display:flex;flex-direction:column;align-items:center;justify-content:center;
-    border:2px dashed #cbd5e1;border-radius:12px;padding:36px 20px;cursor:pointer;
-    text-align:center;transition:.15s;
+  header {
+    background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+    color: #fff;
+    padding: 22px 28px;
   }
-  label.dropzone:hover{border-color:var(--accent);background:#f8fafc;}
-  label.dropzone strong{font-size:1rem;color:var(--text);}
-  label.dropzone span{color:var(--muted);font-size:.85rem;margin-top:4px;}
-  input[type=file]{display:none;}
-  #filename{margin-top:12px;font-size:.9rem;color:var(--accent-dark);font-weight:600;min-height:1.2em;}
-  button{
-    margin-top:18px;width:100%;padding:13px 18px;border:none;border-radius:9px;
-    background:var(--accent);color:#fff;font-size:1rem;font-weight:600;cursor:pointer;transition:.15s;
+  header h1 { margin: 0; font-size: 22px; }
+  header p { margin: 4px 0 0; opacity: .9; font-size: 14px; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 60px; }
+  .card {
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 22px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04);
   }
-  button:hover{background:var(--accent-dark);}
-  .msg{padding:14px 16px;border-radius:9px;margin-bottom:18px;font-size:.92rem;line-height:1.5;}
-  .msg.error{background:#fef2f2;color:var(--err);border:1px solid #fecaca;}
-  .msg.ok{background:#f0fdf4;color:var(--ok);border:1px solid #bbf7d0;}
-  .msg.warn{background:#fffbeb;color:var(--warn);border:1px solid #fde68a;}
-  .warnings{margin:0;padding-left:18px;}
-  .warnings li{margin-bottom:6px;}
-  .download-btn{
-    display:inline-block;background:var(--ok);color:#fff;text-decoration:none;
-    padding:12px 20px;border-radius:9px;font-weight:600;margin-top:6px;
+  .card h2 { margin-top: 0; font-size: 18px; color: var(--primary-dark); }
+  .drop {
+    border: 2px dashed #b7c1d1;
+    border-radius: 10px;
+    padding: 34px 20px;
+    text-align: center;
+    background: #fafbfd;
   }
-  .download-btn:hover{background:#15803d;}
-  pre.preview{
-    background:#0f172a;color:#e2e8f0;padding:16px;border-radius:9px;
-    font-size:.78rem;overflow-x:auto;max-height:320px;line-height:1.5;
+  input[type=file] { margin: 14px 0; }
+  button, .btn {
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    padding: 11px 20px;
+    border-radius: 7px;
+    font-size: 14px;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-block;
   }
-  .steps{color:var(--muted);font-size:.85rem;line-height:1.6;}
-  .steps b{color:var(--text);}
-  footer{color:#94a3b8;font-size:.78rem;text-align:center;margin-top:40px;}
+  button:hover, .btn:hover { background: var(--primary-dark); }
+  button.secondary { background: #6b7280; }
+  button.secondary:hover { background: #4b5563; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+  .error-box {
+    background: #fdecea; border: 1px solid #f5c2c0; color: #7a1a17;
+    padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 14px;
+  }
+  .stat-row { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+  .stat {
+    background: #eef2f9; border-radius: 8px; padding: 10px 16px; font-size: 14px;
+  }
+  .stat b { display: block; font-size: 20px; color: var(--primary-dark); }
+  .unit {
+    border: 1px solid var(--border); border-radius: 10px; margin-bottom: 18px; overflow: hidden;
+  }
+  .unit-head {
+    background: #eef2f9; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;
+  }
+  .unit-head h3 { margin: 0; font-size: 15px; color: var(--primary-dark); }
+  .unit-head small { color: #555; }
+  .qrow {
+    padding: 14px 16px; border-top: 1px solid #eee;
+  }
+  .qrow.unsure { background: var(--warn-bg); }
+  .qtext { font-weight: 600; margin-bottom: 8px; font-size: 14.5px; }
+  .opt {
+    display: flex; align-items: flex-start; gap: 8px; padding: 4px 0; font-size: 14px;
+  }
+  .opt input { margin-top: 3px; }
+  .badge {
+    display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; margin-left: 8px; font-weight: 600;
+  }
+  .badge.ok { background: #e3f3e2; color: var(--ok); }
+  .badge.warn { background: #fdecc8; color: var(--warn); }
+  .badge.key { background: #e0eefc; color: #1a5fb4; }
+  .toolbar {
+    position: sticky; bottom: 0; background: #fff; border-top: 1px solid var(--border);
+    padding: 14px 22px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+    box-shadow: 0 -2px 6px rgba(0,0,0,.05); border-radius: 0 0 10px 10px;
+  }
+  .muted { color: #666; font-size: 13px; }
+  .example {
+    background: #0d1117; color: #d1d5da; font-family: Consolas, monospace; font-size: 12.5px;
+    padding: 14px 16px; border-radius: 8px; overflow-x: auto; white-space: pre;
+  }
 </style>
 </head>
 <body>
+<header>
+  <h1>📝 <?php echo APP_TITLE; ?></h1>
+  <p>Convierte bancos de preguntas de Word (cualquier formato de tus docentes) al formato AIKEN, listo para importar en Moodle u otras plataformas.</p>
+</header>
+
 <div class="wrap">
-  <h1>Conversor de banco de preguntas a formato AIKEN</h1>
-  <p class="subtitle">Sube tu banco de preguntas en Word (.docx) o PDF y descarga el .txt listo para importar en Moodle.</p>
 
-  <?php if ($error): ?>
-    <div class="msg error"><strong>⚠ No se pudo procesar el archivo.</strong><br><?= htmlspecialchars($error) ?></div>
-  <?php endif; ?>
+<?php foreach ($errors as $err): ?>
+  <div class="error-box">⚠️ <?php echo $err; ?></div>
+<?php endforeach; ?>
 
-  <?php if ($result): ?>
-    <div class="card">
-      <div class="msg ok">✅ Se detectaron <strong><?= $result['count'] ?></strong> preguntas y se generó el archivo AIKEN.</div>
-
-      <?php if (!empty($result['warnings'])): ?>
-        <div class="msg warn">
-          <strong>⚠ <?= count($result['warnings']) ?> pregunta(s) necesitan revisión manual:</strong>
-          <ul class="warnings">
-            <?php foreach ($result['warnings'] as $w): ?>
-              <li><?= htmlspecialchars($w) ?></li>
-            <?php endforeach; ?>
-          </ul>
-        </div>
-      <?php endif; ?>
-
-      <a class="download-btn" href="?download=1">⬇ Descargar <?= htmlspecialchars($result['filename']) ?></a>
-
-      <p style="margin-top:22px;font-weight:600;">Vista previa:</p>
-      <pre class="preview"><?= htmlspecialchars($result['preview']) ?><?= mb_strlen($result['preview']) >= 1500 ? "\n..." : '' ?></pre>
-    </div>
-  <?php endif; ?>
+<?php if (empty($batches)): ?>
 
   <div class="card">
-    <form action="" method="post" enctype="multipart/form-data" id="uploadForm">
-      <label class="dropzone" for="banco">
-        <strong>📄 Haz clic para elegir tu archivo</strong>
-        <span>Word (.docx) o PDF — máx. 20 MB</span>
-      </label>
-      <input type="file" name="banco" id="banco" accept=".docx,.pdf" required>
-      <div id="filename"></div>
-      <button type="submit">Convertir a formato AIKEN</button>
+    <h2>1. Sube tus documentos Word</h2>
+    <form method="post" enctype="multipart/form-data">
+      <input type="hidden" name="action" value="upload">
+      <div class="drop">
+        <p><strong>Selecciona uno o varios archivos .docx</strong><br>
+        <span class="muted">Bancos de preguntas, controles de lectura, etc. — cada archivo se tratará como una "unidad".</span></p>
+        <input type="file" name="docs[]" accept=".docx" multiple required>
+      </div>
+      <div class="actions">
+        <button type="submit">Procesar documentos</button>
+      </div>
     </form>
   </div>
 
-  <div class="card steps">
-    <p><b>Cómo debe estar tu documento para mejores resultados:</b></p>
-    <p>
-      <b>Word (.docx):</b> cada alternativa (a. b. c. d.) en su propio párrafo, y la
-      alternativa correcta en <b>negrita y/o resaltada</b> (el estilo típico de un
-      banco de preguntas con clave marcada). Funciona tanto si las preguntas están
-      en tablas como en texto corrido.
-    </p>
-    <p>
-      <b>PDF:</b> como el PDF no conserva el resaltado al extraer texto, marca la
-      alternativa correcta con un asterisco al inicio (<code>*b. Texto...</code>),
-      con <code>(correcta)</code> al final, o incluye al final del documento un
-      bloque "<b>Clave de respuestas</b>: 1-b, 2-c, 3-a...".
-    </p>
-    <p>Las preguntas que no puedan detectarse automáticamente se listarán como advertencia para que las corrijas a mano en el .txt antes de subirlo a Moodle.</p>
+  <div class="card">
+    <h2>¿Cómo detecta la respuesta correcta?</h2>
+    <p class="muted">El sistema reconoce automáticamente la respuesta marcada por el docente usando, en este orden de prioridad:</p>
+    <ol class="muted">
+      <li>Un símbolo de verificación junto a la opción (✓, ✔, ☑).</li>
+      <li>Texto resaltado (highlight / marcador de color) sobre la opción correcta.</li>
+      <li>Una opción en <strong>negrita</strong> cuando las demás no lo están.</li>
+      <li>Si nada de lo anterior aparece, busca automáticamente una <strong>clave de respuestas al final del documento</strong> (ej. "Clave rápida de respuestas: 01: b 02: c ...", "Solucionario", "Hoja de respuestas") y la usa para completar las preguntas correspondientes.</li>
+    </ol>
+    <p class="muted">Si ninguna de estas señales aparece con claridad, la pregunta se marca como <span class="badge warn">revisar</span> para que la confirmes manualmente antes de descargar — nunca se descarta una pregunta por esto.</p>
+    <p class="muted">Formato de salida (AIKEN):</p>
+    <div class="example">¿Cuál es la capital de Perú?
+A) Bogotá
+B) Lima
+C) Quito
+D) Santiago
+ANSWER: B</div>
   </div>
 
-  <footer>Formato AIKEN estándar de Moodle · el contenido de enunciados y alternativas no se modifica, solo se reformatea.</footer>
+<?php else: ?>
+
+  <form method="post" id="reviewForm">
+    <input type="hidden" name="action" value="save" id="formAction">
+
+    <div class="card">
+      <h2>2. Revisa las respuestas detectadas</h2>
+      <div class="stat-row">
+        <div class="stat"><b><?php echo count($batches); ?></b>archivo(s) / unidad(es)</div>
+        <div class="stat"><b><?php echo $totalQuestions; ?></b>preguntas totales</div>
+        <div class="stat"><b style="color:<?php echo $totalUnsure ? 'var(--warn)' : 'var(--ok)'; ?>"><?php echo $totalUnsure; ?></b>por confirmar manualmente</div>
+      </div>
+      <p class="muted">Las filas en color ámbar no tuvieron una señal clara de respuesta correcta: verifica y marca la opción correcta con el botón de radio antes de descargar. Todo cambio se guarda al descargar o al presionar "Guardar cambios".</p>
+    </div>
+
+    <?php foreach ($batches as $bi => $batch): ?>
+      <div class="unit">
+        <div class="unit-head">
+          <div>
+            <h3><?php echo htmlspecialchars($batch['label']); ?></h3>
+            <small><?php echo htmlspecialchars($batch['filename']); ?> · <?php echo count($batch['questions']); ?> preguntas</small>
+          </div>
+          <button type="submit" name="action" value="download_unit" onclick="document.getElementById('batchIndexField').value=<?php echo $bi; ?>;">⬇️ Descargar esta unidad (.txt)</button>
+        </div>
+
+        <?php foreach ($batch['questions'] as $qi => $q): ?>
+          <div class="qrow <?php echo empty($q['confident']) ? 'unsure' : ''; ?>">
+            <div class="qtext">
+              <?php echo ($qi + 1) . '. ' . htmlspecialchars($q['text']); ?>
+              <?php if (!empty($q['confident']) && ($q['source'] ?? '') === 'clave_final'): ?>
+                <span class="badge key">detectada (clave final)</span>
+              <?php elseif (!empty($q['confident']) && ($q['source'] ?? '') === 'manual'): ?>
+                <span class="badge ok">confirmada manualmente</span>
+              <?php elseif (!empty($q['confident'])): ?>
+                <span class="badge ok">detectada</span>
+              <?php else: ?>
+                <span class="badge warn">revisar</span>
+              <?php endif; ?>
+            </div>
+            <?php foreach ($q['options'] as $oi => $optText):
+                $letter = $OPTION_LETTERS[$oi];
+                $checked = ($oi === $q['correct']) ? 'checked' : '';
+            ?>
+              <label class="opt">
+                <input type="radio" name="ans_<?php echo $bi; ?>_<?php echo $qi; ?>" value="<?php echo $letter; ?>" <?php echo $checked; ?>>
+                <span><strong><?php echo $letter; ?>)</strong> <?php echo htmlspecialchars($optText); ?></span>
+              </label>
+            <?php endforeach; ?>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    <?php endforeach; ?>
+
+    <input type="hidden" name="batch_index" id="batchIndexField" value="0">
+
+    <div class="toolbar">
+      <button type="submit" name="action" value="save" class="secondary">💾 Guardar cambios</button>
+      <button type="submit" name="action" value="download_zip">📦 Descargar por unidad (.zip)</button>
+      <button type="submit" name="action" value="download_combined">📄 Descargar todo en conjunto (.txt)</button>
+      <button type="submit" name="action" value="reset" class="secondary" formnovalidate>🔄 Empezar de nuevo</button>
+      <span class="muted">Los botones de descarga guardan automáticamente tus correcciones.</span>
+    </div>
+  </form>
+
+<?php endif; ?>
+
 </div>
-<script>
-  document.getElementById('banco').addEventListener('change', function(e){
-    const f = e.target.files[0];
-    document.getElementById('filename').textContent = f ? ('Seleccionado: ' + f.name) : '';
-  });
-</script>
 </body>
 </html>
