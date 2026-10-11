@@ -1,0 +1,321 @@
+{
+ "c01_std": {
+  "file": "c01_std.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c02_paren_dot": {
+  "file": "c02_paren_dot.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c03_pregunta_word": {
+  "file": "c03_pregunta_word.txt",
+  "ext": "txt",
+  "exp": [
+   2,
+   0
+  ]
+ },
+ "c04_p_q_prefix": {
+  "file": "c04_p_q_prefix.txt",
+  "ext": "txt",
+  "exp": [
+   0,
+   1
+  ]
+ },
+ "c05_no_space": {
+  "file": "c05_no_space.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   2
+  ]
+ },
+ "c06_letter_alone": {
+  "file": "c06_letter_alone.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   0
+  ]
+ },
+ "c07_key_end_dash": {
+  "file": "c07_key_end_dash.txt",
+  "ext": "txt",
+  "exp": [
+   0,
+   1,
+   2
+  ]
+ },
+ "c08_key_dotdash": {
+  "file": "c08_key_dotdash.txt",
+  "ext": "txt",
+  "exp": [
+   0,
+   1,
+   2
+  ]
+ },
+ "c09_key_sequence": {
+  "file": "c09_key_sequence.txt",
+  "ext": "txt",
+  "exp": [
+   0,
+   1,
+   2,
+   1,
+   0
+  ]
+ },
+ "c10_inline_marks": {
+  "file": "c10_inline_marks.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1,
+   2,
+   0
+  ]
+ },
+ "c12_true_false": {
+  "file": "c12_true_false.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   0,
+   0
+  ]
+ },
+ "c13_essay_mixed": {
+  "file": "c13_essay_mixed.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   "E",
+   1,
+   "E"
+  ]
+ },
+ "c14_wrapped": {
+  "file": "c14_wrapped.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c15_restart_key": {
+  "file": "c15_restart_key.txt",
+  "ext": "txt",
+  "exp": [
+   0,
+   1,
+   2,
+   1
+  ]
+ },
+ "c16_noise_header": {
+  "file": "c16_noise_header.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c17_inline_options": {
+  "file": "c17_inline_options.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c18_text_answer": {
+  "file": "c18_text_answer.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c19_bullet_options": {
+  "file": "c19_bullet_options.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c20_answer_variants": {
+  "file": "c20_answer_variants.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1,
+   0,
+   1
+  ]
+ },
+ "c22_statements": {
+  "file": "c22_statements.txt",
+  "ext": "txt",
+  "exp": [
+   2,
+   2
+  ]
+ },
+ "c24_dash_options": {
+  "file": "c24_dash_options.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c25_numero": {
+  "file": "c25_numero.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c26_blank_lines_everywhere": {
+  "file": "c26_blank_lines_everywhere.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c27_brackets": {
+  "file": "c27_brackets.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c28_essay_numbered_lines": {
+  "file": "c28_essay_numbered_lines.txt",
+  "ext": "txt",
+  "exp": [
+   "E",
+   "E"
+  ]
+ },
+ "d01_table_rows": {
+  "file": "d01_table_rows.docx",
+  "ext": "docx",
+  "exp": [
+   1,
+   1,
+   1
+  ]
+ },
+ "d02_bold_answer": {
+  "file": "d02_bold_answer.docx",
+  "ext": "docx",
+  "exp": [
+   1,
+   1,
+   1
+  ]
+ },
+ "d03_highlight": {
+  "file": "d03_highlight.docx",
+  "ext": "docx",
+  "exp": [
+   1,
+   1,
+   2
+  ]
+ },
+ "d05_key_table_end": {
+  "file": "d05_key_table_end.docx",
+  "ext": "docx",
+  "exp": [
+   1,
+   1,
+   2
+  ]
+ },
+ "p01_wrapped_pdf": {
+  "file": "p01_wrapped_pdf_src.pdf",
+  "ext": "pdf",
+  "exp": [
+   1,
+   1,
+   1
+  ]
+ },
+ "c30_vertical_key": {
+  "file": "c30_vertical_key.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1,
+   2
+  ]
+ },
+ "c31_unnumbered_blank": {
+  "file": "c31_unnumbered_blank.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c32_degree": {
+  "file": "c32_degree.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c33_points_heading": {
+  "file": "c33_points_heading.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c35_lower_dot": {
+  "file": "c35_lower_dot.txt",
+  "ext": "txt",
+  "exp": [
+   1,
+   1
+  ]
+ },
+ "c36_columns_key": {
+  "file": "c36_columns_key.txt",
+  "ext": "txt",
+  "exp": [
+   0,
+   1,
+   0,
+   0
+  ]
+ },
+ "c37_mixed_tf_mcq": {
+  "file": "c37_mixed_tf_mcq.txt",
+  "ext": "txt",
+  "exp": [
+   0,
+   1,
+   1
+  ]
+ }
+}

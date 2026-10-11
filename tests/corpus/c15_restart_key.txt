@@ -1,0 +1,22 @@
+SECCIÓN A
+1. ¿Capital de Perú?
+a) Lima
+b) Quito
+c) Bogotá
+2. ¿Capital de Ecuador?
+a) Lima
+b) Quito
+c) Bogotá
+SECCIÓN B
+1. ¿Capital de Colombia?
+a) Lima
+b) Quito
+c) Bogotá
+2. ¿Capital de Chile?
+a) Lima
+b) Santiago
+c) Bogotá
+
+CLAVES
+Sección A: 1-A 2-B
+Sección B: 1-C 2-B

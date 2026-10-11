@@ -1,0 +1,16 @@
+1. ¿Capital de Perú?
+a) Bogotá
+*b) Lima
+c) Quito
+2. ¿Capital de Ecuador?
+a) Lima
+b) Quito *
+c) Bogotá
+3. ¿Capital de Colombia?
+a) Lima
+b) Quito
+✓ c) Bogotá
+4. ¿Capital de Chile?
+a) Santiago (correcta)
+b) Quito
+c) Bogotá

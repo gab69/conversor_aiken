@@ -1,0 +1,10 @@
+PREGUNTA 1 (2 puntos): ¿Cuál es la capital de Perú?
+a) Bogotá
+b) Lima
+c) Quito
+Respuesta: B
+PREGUNTA 2 (2 puntos): ¿Cuál es la capital de Chile?
+a) Lima
+b) Santiago
+c) Quito
+Respuesta: B

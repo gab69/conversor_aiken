@@ -1,0 +1,11 @@
+Pregunta 1: ¿Cuál es el río más largo?
+(a) Nilo
+(b) Rin
+(c) Amazonas
+Clave: C
+
+Pregunta 2: ¿Cuál es el mayor océano?
+(a) Pacífico
+(b) Atlántico
+(c) Índico
+Clave: A

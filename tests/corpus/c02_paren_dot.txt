@@ -1,0 +1,11 @@
+1) ¿Cuál es la capital de Perú?
+A. Bogotá
+B. Lima
+C. Quito
+Rpta: b
+
+2) ¿Cuánto es 3+3?
+A. 5
+B. 6
+C. 7
+Rpta: B

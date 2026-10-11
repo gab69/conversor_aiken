@@ -1,0 +1,14 @@
+1. ¿Capital de Perú?
+a) Lima
+b) Quito
+2. ¿Capital de Ecuador?
+a) Lima
+b) Quito
+3. ¿Capital de Colombia?
+a) Lima
+b) Quito
+4. ¿Capital de Chile?
+a) Santiago
+b) Quito
+
+Solucionario: 1. A   2. B   3. A   4. A
